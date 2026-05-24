@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""
+adurefs — Shared Filesystem Volume Driver for Docker
+=====================================================
+A lightweight Docker volume plugin by Adure (adure.io) that enables
+named volumes on any shared filesystem (GlusterFS, NFS, CephFS, etc.)
+mounted at a common path across all nodes in a Docker Swarm cluster.
+
+Instead of bind mounts in every compose file, adurefs behaves exactly
+like the built-in local driver but creates volumes in a configurable
+shared directory — making named volumes automatically available on
+every node without replication overhead or complex plugin dependencies.
+
+Usage in compose/stack files:
+  volumes:
+    my_data:
+      driver: adurefs
+
+Or set as default driver in /etc/docker/daemon.json:
+  { "volume-driver": "adurefs" }
+
+Configuration via environment variables:
+  ADUREFS_BASE_PATH   Shared directory for volumes
+                      (default: /mnt/shared/volumes)
+  ADUREFS_SOCKET      Unix socket path
+                      (default: /run/docker/plugins/adurefs.sock)
+  ADUREFS_LOG_LEVEL   Logging level: DEBUG, INFO, WARNING, ERROR
+                      (default: INFO)
+
+Source: https://github.com/AdureIO/adurefs
+"""
+
+import os
+import json
+import logging
+import socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+BASE_PATH   = os.environ.get('ADUREFS_BASE_PATH',  '/mnt/shared/volumes')
+SOCKET_PATH = os.environ.get('ADUREFS_SOCKET',     '/run/docker/plugins/adurefs.sock')
+LOG_LEVEL   = os.environ.get('ADUREFS_LOG_LEVEL',  'INFO').upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format='%(asctime)s [adurefs] %(levelname)s %(message)s'
+)
+log = logging.getLogger('adurefs')
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def vol_path(name: str) -> str:
+    """Return the full filesystem path for a named volume.
+    Sanitizes name to prevent path traversal attacks."""
+    safe = os.path.basename(name)
+    if not safe or safe in ('.', '..'):
+        raise ValueError(f"Invalid volume name: {name!r}")
+    return os.path.join(BASE_PATH, safe)
+
+
+def respond_ok(**kwargs) -> bytes:
+    return json.dumps({"Err": "", **kwargs}).encode()
+
+
+def respond_err(msg: str) -> bytes:
+    log.error(msg)
+    return json.dumps({"Err": msg}).encode()
+
+
+# ── HTTP handler ──────────────────────────────────────────────────────────────
+class VolumeDriver(BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        log.debug(fmt % args)
+
+    def _body(self) -> dict:
+        length = int(self.headers.get('Content-Length', 0))
+        raw = self.rfile.read(length) if length else b'{}'
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+
+    def _send(self, body: bytes, status: int = 200):
+        self.send_response(status)
+        self.send_header('Content-Type',   'application/vnd.docker.plugins.v1+json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        body = self._body()
+        name = body.get('Name', '')
+        endpoint = self.path
+
+        log.debug(f"→ {endpoint} name={name!r}")
+
+        try:
+            # Plugin handshake
+            if endpoint == '/Plugin.Activate':
+                self._send(json.dumps({
+                    "Implements": ["VolumeDriver"]
+                }).encode())
+
+            # Capabilities — global scope means Swarm knows
+            # the volume is available on all nodes
+            elif endpoint == '/VolumeDriver.Capabilities':
+                self._send(json.dumps({
+                    "Capabilities": {"Scope": "global"}
+                }).encode())
+
+            # Create — make the directory, idempotent
+            elif endpoint == '/VolumeDriver.Create':
+                path = vol_path(name)
+                os.makedirs(path, mode=0o755, exist_ok=True)
+                log.info(f"Created volume {name!r} → {path}")
+                self._send(respond_ok())
+
+            # Mount — return path, create dir if missing
+            elif endpoint == '/VolumeDriver.Mount':
+                path = vol_path(name)
+                os.makedirs(path, mode=0o755, exist_ok=True)
+                log.info(f"Mounted volume {name!r} → {path}")
+                self._send(respond_ok(Mountpoint=path))
+
+            # Unmount — nothing to do, directory stays
+            elif endpoint == '/VolumeDriver.Unmount':
+                log.info(f"Unmounted volume {name!r}")
+                self._send(respond_ok())
+
+            # Path — return mountpoint if exists
+            elif endpoint == '/VolumeDriver.Path':
+                path = vol_path(name)
+                if os.path.isdir(path):
+                    self._send(respond_ok(Mountpoint=path))
+                else:
+                    self._send(respond_err(f"Volume {name!r} does not exist"))
+
+            # Get — return volume info
+            elif endpoint == '/VolumeDriver.Get':
+                path = vol_path(name)
+                if os.path.isdir(path):
+                    self._send(respond_ok(Volume={
+                        "Name":       name,
+                        "Mountpoint": path,
+                        "Status":     {"driver": "adurefs", "path": path}
+                    }))
+                else:
+                    self._send(respond_err(f"Volume {name!r} does not exist"))
+
+            # List — scan base directory
+            elif endpoint == '/VolumeDriver.List':
+                volumes = []
+                if os.path.isdir(BASE_PATH):
+                    for entry in os.scandir(BASE_PATH):
+                        if entry.is_dir():
+                            volumes.append({
+                                "Name":       entry.name,
+                                "Mountpoint": entry.path
+                            })
+                self._send(json.dumps({
+                    "Volumes": volumes,
+                    "Err": ""
+                }).encode())
+
+            # Remove — preserve data by default (shared filesystem)
+            # Uncomment shutil.rmtree to enable actual deletion
+            elif endpoint == '/VolumeDriver.Remove':
+                path = vol_path(name)
+                log.info(
+                    f"Remove requested for {name!r} — "
+                    f"data preserved at {path}"
+                )
+                # import shutil; shutil.rmtree(path, ignore_errors=True)
+                self._send(respond_ok())
+
+            else:
+                log.warning(f"Unknown endpoint: {endpoint}")
+                self._send(respond_err(f"Unknown endpoint: {endpoint}"), status=404)
+
+        except ValueError as e:
+            self._send(respond_err(str(e)))
+        except Exception as e:
+            log.exception(f"Unexpected error handling {endpoint}")
+            self._send(respond_err(str(e)))
+
+
+# ── Unix socket HTTP server ───────────────────────────────────────────────────
+class UnixSocketServer(HTTPServer):
+    address_family = socket.AF_UNIX
+
+    def server_bind(self):
+        if os.path.exists(self.server_address):
+            os.remove(self.server_address)
+        super().server_bind()
+        os.chmod(self.server_address, 0o660)
+
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+def main():
+    os.makedirs(BASE_PATH,                    mode=0o755, exist_ok=True)
+    os.makedirs(os.path.dirname(SOCKET_PATH), mode=0o755, exist_ok=True)
+
+    log.info("adurefs volume driver starting")
+    log.info(f"  Base path : {BASE_PATH}")
+    log.info(f"  Socket    : {SOCKET_PATH}")
+    log.info(f"  Log level : {LOG_LEVEL}")
+
+    server = UnixSocketServer(SOCKET_PATH, VolumeDriver)
+
+    log.info("Ready — listening for Docker volume requests")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log.info("Shutting down")
+    finally:
+        server.server_close()
+        if os.path.exists(SOCKET_PATH):
+            os.remove(SOCKET_PATH)
+
+
+if __name__ == '__main__':
+    main()

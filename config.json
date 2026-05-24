@@ -1,0 +1,42 @@
+{
+	"Description": "adurefs — Shared Filesystem Volume Driver for Docker Swarm",
+	"Documentation": "https://github.com/AdureIO/adurefs",
+	"Entrypoint": ["/usr/local/bin/adurefs"],
+	"Env": [
+		{
+			"Name": "ADUREFS_BASE_PATH",
+			"Description": "Base directory for volumes on the shared filesystem",
+			"Settable": ["value"],
+			"Value": "/mnt/shared/volumes"
+		},
+		{
+			"Name": "ADUREFS_LOG_LEVEL",
+			"Description": "Log level: DEBUG, INFO, WARNING, ERROR",
+			"Settable": ["value"],
+			"Value": "INFO"
+		}
+	],
+	"Interface": {
+		"Socket": "adurefs.sock",
+		"Types": ["docker.volumedriver/1.0"]
+	},
+	"Linux": {
+		"AllowAllDevices": false,
+		"Capabilities": ["CAP_SYS_ADMIN"],
+		"Devices": null
+	},
+	"Mounts": [
+		{
+			"Source": "/mnt/shared",
+			"Destination": "/mnt/shared",
+			"Type": "bind",
+			"Options": ["rbind"]
+		}
+	],
+	"Network": {
+		"Type": "host"
+	},
+	"PropagatedMount": "/mnt/shared",
+	"WorkDir": "",
+	"User": {}
+}

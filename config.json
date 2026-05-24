@@ -5,9 +5,9 @@
 	"Env": [
 		{
 			"Name": "ADUREFS_BASE_PATH",
-			"Description": "Base directory for volumes on the shared filesystem",
+			"Description": "Internal base path (do not change, leave as /var/lib/docker/volumes)",
 			"Settable": ["value"],
-			"Value": "/mnt/shared/volumes"
+			"Value": "/var/lib/docker/volumes"
 		},
 		{
 			"Name": "ADUREFS_LOG_LEVEL",
@@ -27,8 +27,11 @@
 	},
 	"Mounts": [
 		{
-			"Source": "/mnt/shared",
-			"Destination": "/mnt/shared",
+			"Name": "volumes",
+			"Description": "Base directory on the host where volumes are stored",
+			"Settable": ["source"],
+			"Source": "/var/lib/docker/volumes",
+			"Destination": "/var/lib/docker/volumes",
 			"Type": "bind",
 			"Options": ["rbind"]
 		}
@@ -36,7 +39,7 @@
 	"Network": {
 		"Type": "host"
 	},
-	"PropagatedMount": "/mnt/shared",
+	"PropagatedMount": "/var/lib/docker/volumes",
 	"WorkDir": "",
 	"User": {}
 }

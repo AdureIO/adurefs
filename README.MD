@@ -16,8 +16,8 @@ without replication overhead or complex plugin dependencies.
 ## Installation
 
 ```bash
-docker plugin install adure/adurefs \
-  ADUREFS_BASE_PATH=/mnt/gluster/swarm/volumes \
+docker plugin install adureio/adurefs \
+  volumes.source=/mnt/gluster/swarm/volumes \
   --grant-all-permissions
 ```
 

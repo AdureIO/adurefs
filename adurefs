@@ -35,6 +35,7 @@ import json
 import logging
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import subprocess
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 BASE_PATH   = os.environ.get('ADUREFS_BASE_PATH',  '/mnt/shared/volumes')
@@ -47,6 +48,28 @@ logging.basicConfig(
 )
 log = logging.getLogger('adurefs')
 
+def is_mounted(path: str) -> bool:
+    """Verify path is actually a mounted filesystem, not just a local dir."""
+    try:
+        result = subprocess.run(
+            ['findmnt', '--target', path, '--output', 'FSTYPE', '--noheadings'],
+            capture_output=True, text=True
+        )
+        return 'fuse.glusterfs' in result.stdout
+    except Exception:
+        return False
+
+def wait_for_mount(path: str, timeout: int = 120):
+    """Block until the shared filesystem is mounted."""
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if is_mounted(path):
+            log.info(f"Shared filesystem confirmed at {path}")
+            return True
+        log.warning(f"Waiting for mount at {path}...")
+        time.sleep(5)
+    raise RuntimeError(f"Shared filesystem not mounted at {path} after {timeout}s")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def vol_path(name: str) -> str:
@@ -198,6 +221,8 @@ class UnixSocketServer(HTTPServer):
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 def main():
+    wait_for_mount(BASE_PATH)
+    
     os.makedirs(BASE_PATH,                    mode=0o755, exist_ok=True)
     os.makedirs(os.path.dirname(SOCKET_PATH), mode=0o755, exist_ok=True)
 

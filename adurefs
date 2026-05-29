@@ -13,6 +13,7 @@ import logging
 import signal
 import socket
 import sys
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -167,21 +168,23 @@ def main():
 
     server = UnixSocketServer(SOCKET_PATH, VolumeDriver)
 
+    log.info("Ready — listening for Docker volume requests")
+
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
+
     def _shutdown(signum, frame):
         log.info("Shutting down")
-        server.shutdown()
-
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    log.info("Ready — listening for Docker volume requests")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log.info("Shutting down")
-    finally:
         server.server_close()
         if os.path.exists(SOCKET_PATH):
             os.remove(SOCKET_PATH)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    server_thread.join()
 
 if __name__ == '__main__':
     main()

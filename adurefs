@@ -10,6 +10,7 @@ mounted at a common path across all nodes in a Docker Swarm cluster.
 import os
 import json
 import logging
+import signal
 import socket
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -165,6 +166,12 @@ def main():
     log.info(f"  Log level : {LOG_LEVEL}")
 
     server = UnixSocketServer(SOCKET_PATH, VolumeDriver)
+
+    def _shutdown(signum, frame):
+        log.info("Shutting down")
+        server.shutdown()
+
+    signal.signal(signal.SIGTERM, _shutdown)
 
     log.info("Ready — listening for Docker volume requests")
     try:

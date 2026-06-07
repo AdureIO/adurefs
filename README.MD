@@ -13,20 +13,36 @@ adurefs solves this by creating volumes as subdirectories of a shared
 filesystem mount — making named volumes automatically available on every node
 without replication overhead or complex plugin dependencies.
 
+The plugin returns the host-side GlusterFS path directly as the Mountpoint.
+Docker performs a plain bind mount — no PropagatedMount, no extra FUSE layer,
+no orphaned handles on unclean shutdown.
+
 ## Installation
 
 ```bash
 docker plugin install adureio/adurefs \
-  volumes.source=/mnt/gluster/swarm/volumes \
+  ADUREFS_HOST_PATH=/mnt/gluster/swarm/volumes \
   --grant-all-permissions
+```
+
+## Upgrade
+
+```bash
+docker plugin disable --force adureio/adurefs:latest
+docker plugin upgrade adureio/adurefs:latest
+docker plugin set adureio/adurefs:latest ADUREFS_HOST_PATH=/mnt/gluster/swarm/volumes
+docker plugin enable adureio/adurefs:latest
 ```
 
 ## Configuration
 
-| Variable            | Default               | Description                                         |
-| ------------------- | --------------------- | --------------------------------------------------- |
-| `ADUREFS_BASE_PATH` | `/mnt/shared/volumes` | Base directory for volumes on the shared filesystem |
-| `ADUREFS_LOG_LEVEL` | `INFO`                | Log level: DEBUG, INFO, WARNING, ERROR              |
+| Variable             | Default                       | Settable | Description                                                        |
+| -------------------- | ----------------------------- | -------- | ------------------------------------------------------------------ |
+| `ADUREFS_HOST_PATH`  | `/mnt/gluster/swarm/volumes`  | yes      | Host-side path of the shared filesystem — returned as Mountpoint   |
+| `ADUREFS_KEEP_DATA`  | `true`                        | yes      | When true, Remove only deletes the volume record, data is preserved |
+| `ADUREFS_LOG_LEVEL`  | `INFO`                        | yes      | Log level: DEBUG, INFO, WARNING, ERROR                             |
+
+> `ADUREFS_BASE_PATH` is the plugin-internal mount path and should not be changed.
 
 ## Usage
 
@@ -41,34 +57,17 @@ services:
 
 volumes:
     db_data:
-        driver: adurefs
-```
-
-### Set as default driver (no driver needed in compose files)
-
-Add to `/etc/docker/daemon.json` on all nodes:
-
-```json
-{
-	"volume-driver": "adurefs"
-}
-```
-
-Then restart Docker and use plain named volumes:
-
-```yaml
-volumes:
-    db_data: # automatically uses adurefs
+        driver: adureio/adurefs:latest
 ```
 
 ### Manual volume management
 
 ```bash
 # Create
-docker volume create --driver adurefs my_data
+docker volume create --driver adureio/adurefs:latest my_data
 
 # List
-docker volume ls --filter driver=adurefs
+docker volume ls --filter driver=adureio/adurefs:latest
 
 # Inspect
 docker volume inspect my_data
@@ -79,34 +78,63 @@ docker volume rm my_data
 
 ## Requirements
 
-- Shared filesystem mounted at the same path on all Swarm nodes
+- Shared filesystem mounted at the **same path on all Swarm nodes** before Docker starts
 - Works with: GlusterFS, NFS, CephFS, or any POSIX-compatible shared mount
+- Recommended: mount via a systemd `.mount` unit with `After=network-online.target` and `Before=docker.service`
+
+## Recommended systemd mount unit
+
+```ini
+[Unit]
+Description=GlusterFS swarm volume mount
+After=network-online.target glusterd.service
+Wants=network-online.target glusterd.service
+Before=docker.service
+
+[Mount]
+What=nv01.example.com:/swarm
+Where=/mnt/gluster/swarm
+Type=glusterfs
+Options=defaults,_netdev,backup-volfile-servers=nv02.example.com:nv03.example.com
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The `Before=docker.service` ensures GlusterFS is mounted before Docker (and the plugin) starts.
+
+## GlusterFS stability recommendations
+
+```bash
+# Auto-resolve split-brain using most recently modified file
+gluster volume set swarm cluster.favorite-child-policy mtime
+
+# Reduce write window lost on node failure
+gluster volume set swarm performance.write-behind-window-size 1MB
+```
+
+For containers writing frequently to GlusterFS (e.g. MongoDB), increase the stop grace period so the process flushes cleanly before Docker kills it:
+
+```yaml
+deploy:
+  restart_policy:
+    condition: any
+stop_grace_period: 60s
+```
 
 ## Building from source
 
 ```bash
-git clone https://github.com/adureio/adurefs
-cd adurefs
-
-# Build rootfs
-docker build -t adurefs-rootfs .
-id=$(docker create adurefs-rootfs true)
-mkdir -p rootfs
-docker export "$id" | tar -x -C rootfs
-docker rm -vf "$id"
-docker rmi adurefs-rootfs
-
-# Create and push plugin
-docker plugin create adureio/adurefs .
-docker plugin push adureio/adurefs
+sh build.sh
 ```
 
 ## Notes
 
 - Volume **Remove** preserves data on the shared filesystem by default
-  (safe for shared storage — prevents accidental data loss)
-- Volume **Scope** is `global` — Docker Swarm knows the volume is
-  available on all nodes
+  (`ADUREFS_KEEP_DATA=true`) — prevents accidental data loss on shared storage
+- Volume **Scope** is `global` — Docker Swarm knows the volume is available on all nodes
+- No PropagatedMount — the plugin returns the host GlusterFS path directly,
+  avoiding stale FUSE handles on unclean shutdown
 - No external Python dependencies — uses stdlib only
 
 ## License

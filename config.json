@@ -5,9 +5,21 @@
 	"Env": [
 		{
 			"Name": "ADUREFS_BASE_PATH",
-			"Description": "Internal base path (do not change, leave as /var/lib/docker/volumes)",
+			"Description": "Internal mount path inside the plugin container — must match Mounts.Destination",
+			"Settable": [],
+			"Value": "/data/volumes"
+		},
+		{
+			"Name": "ADUREFS_HOST_PATH",
+			"Description": "Host-side path of the shared filesystem (returned as Mountpoint to Docker)",
 			"Settable": ["value"],
-			"Value": "/var/lib/docker/volumes"
+			"Value": "/mnt/gluster/swarm/volumes"
+		},
+		{
+			"Name": "ADUREFS_KEEP_DATA",
+			"Description": "When true, Remove only deletes the volume record — data on the filesystem is preserved",
+			"Settable": ["value"],
+			"Value": "true"
 		},
 		{
 			"Name": "ADUREFS_LOG_LEVEL",
@@ -28,10 +40,10 @@
 	"Mounts": [
 		{
 			"Name": "volumes",
-			"Description": "Base directory on the host where volumes are stored",
+			"Description": "Shared filesystem directory bind-mounted into the plugin for directory management",
 			"Settable": ["source"],
-			"Source": "/var/lib/docker/volumes",
-			"Destination": "/var/lib/docker/volumes",
+			"Source": "/mnt/gluster/swarm/volumes",
+			"Destination": "/data/volumes",
 			"Type": "bind",
 			"Options": ["rbind"]
 		}
@@ -39,7 +51,7 @@
 	"Network": {
 		"Type": "host"
 	},
-	"PropagatedMount": "/var/lib/docker/volumes",
+	"PropagatedMount": "/data/volumes",
 	"WorkDir": "",
 	"User": {}
 }

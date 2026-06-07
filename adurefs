@@ -10,6 +10,7 @@ mounted at a common path across all nodes in a Docker Swarm cluster.
 import os
 import json
 import logging
+import shutil
 import signal
 import socket
 import sys
@@ -17,9 +18,13 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-BASE_PATH   = os.environ.get('ADUREFS_BASE_PATH',  '/var/lib/docker/volumes')
+BASE_PATH   = os.environ.get('ADUREFS_BASE_PATH',  '/data/volumes')
+HOST_PATH   = os.environ.get('ADUREFS_HOST_PATH',  '/mnt/gluster/swarm/volumes')
+KEEP_DATA   = os.environ.get('ADUREFS_KEEP_DATA',  'true').lower() == 'true'
 SOCKET_PATH = os.environ.get('ADUREFS_SOCKET',     '/run/docker/plugins/adurefs.sock')
 LOG_LEVEL   = os.environ.get('ADUREFS_LOG_LEVEL',  'INFO').upper()
+
+MARKER      = '.adurefs'   # marker file inside every managed volume directory
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -27,14 +32,39 @@ logging.basicConfig(
 )
 log = logging.getLogger('adurefs')
 
+# ── Mount reference tracking ──────────────────────────────────────────────────
+# Tracks active mount IDs per volume: { volume_name: { mount_id, ... } }
+_mount_refs: dict = {}
+_mount_lock = threading.Lock()
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def vol_path(name: str) -> str:
-    """Return the full filesystem path for a named volume.
-    Sanitizes name to prevent path traversal attacks."""
+    """Return the plugin-internal path for a named volume (used for dir management)."""
     safe = os.path.basename(name)
     if not safe or safe in ('.', '..'):
         raise ValueError(f"Invalid volume name: {name!r}")
     return os.path.join(BASE_PATH, safe)
+
+def host_vol_path(name: str) -> str:
+    """Return the host-side path for a named volume (returned as Mountpoint to Docker)."""
+    safe = os.path.basename(name)
+    if not safe or safe in ('.', '..'):
+        raise ValueError(f"Invalid volume name: {name!r}")
+    return os.path.join(HOST_PATH, safe)
+
+def marker_path(name: str) -> str:
+    return os.path.join(vol_path(name), MARKER)
+
+def is_managed(name: str) -> bool:
+    """Return True if this directory was created by adurefs."""
+    return os.path.isfile(marker_path(name))
+
+def create_volume(path: str):
+    """Create the volume directory and place the marker file."""
+    os.makedirs(path, mode=0o755, exist_ok=True)
+    marker = os.path.join(path, MARKER)
+    if not os.path.exists(marker):
+        open(marker, 'w').close()
 
 def respond_ok(**kwargs) -> bytes:
     return json.dumps({"Err": "", **kwargs}).encode()
@@ -63,13 +93,15 @@ class VolumeDriver(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
     def do_POST(self):
         body = self._body()
         name = body.get('Name', '')
+        mount_id = body.get('ID', '')
         endpoint = self.path
 
-        log.debug(f"→ {endpoint} name={name!r}")
+        log.debug(f"→ {endpoint} name={name!r} id={mount_id!r}")
 
         try:
             if endpoint == '/Plugin.Activate':
@@ -84,34 +116,42 @@ class VolumeDriver(BaseHTTPRequestHandler):
 
             elif endpoint == '/VolumeDriver.Create':
                 path = vol_path(name)
-                os.makedirs(path, mode=0o755, exist_ok=True)
+                create_volume(path)
                 log.info(f"Created volume {name!r} → {path}")
                 self._send(respond_ok())
 
             elif endpoint == '/VolumeDriver.Mount':
                 path = vol_path(name)
-                os.makedirs(path, mode=0o755, exist_ok=True)
-                log.info(f"Mounted volume {name!r} → {path}")
-                self._send(respond_ok(Mountpoint=path))
+                create_volume(path)  # ensure exists even if Create was skipped
+                with _mount_lock:
+                    _mount_refs.setdefault(name, set()).add(mount_id)
+                mountpoint = host_vol_path(name)
+                log.info(f"Mounted volume {name!r} (id={mount_id!r}, refs={len(_mount_refs[name])}) → {mountpoint}")
+                self._send(respond_ok(Mountpoint=mountpoint))
 
             elif endpoint == '/VolumeDriver.Unmount':
-                log.info(f"Unmounted volume {name!r}")
+                with _mount_lock:
+                    refs = _mount_refs.get(name, set())
+                    refs.discard(mount_id)
+                    if not refs:
+                        _mount_refs.pop(name, None)
+                    remaining = len(refs)
+                log.info(f"Unmounted volume {name!r} (id={mount_id!r}, refs remaining={remaining})")
                 self._send(respond_ok())
 
             elif endpoint == '/VolumeDriver.Path':
-                path = vol_path(name)
-                if os.path.isdir(path):
-                    self._send(respond_ok(Mountpoint=path))
+                if is_managed(name):
+                    self._send(respond_ok(Mountpoint=host_vol_path(name)))
                 else:
                     self._send(respond_err(f"Volume {name!r} does not exist"))
 
             elif endpoint == '/VolumeDriver.Get':
-                path = vol_path(name)
-                if os.path.isdir(path):
+                if is_managed(name):
+                    mountpoint = host_vol_path(name)
                     self._send(respond_ok(Volume={
                         "Name":       name,
-                        "Mountpoint": path,
-                        "Status":     {"driver": "adurefs", "path": path}
+                        "Mountpoint": mountpoint,
+                        "Status":     {"driver": "adurefs", "mountpoint": mountpoint}
                     }))
                 else:
                     self._send(respond_err(f"Volume {name!r} does not exist"))
@@ -120,10 +160,10 @@ class VolumeDriver(BaseHTTPRequestHandler):
                 volumes = []
                 if os.path.isdir(BASE_PATH):
                     for entry in os.scandir(BASE_PATH):
-                        if entry.is_dir():
+                        if entry.is_dir() and os.path.isfile(
+                                os.path.join(entry.path, MARKER)):
                             volumes.append({
-                                "Name":       entry.name,
-                                "Mountpoint": entry.path
+                                "Name": entry.name
                             })
                 self._send(json.dumps({
                     "Volumes": volumes,
@@ -132,7 +172,16 @@ class VolumeDriver(BaseHTTPRequestHandler):
 
             elif endpoint == '/VolumeDriver.Remove':
                 path = vol_path(name)
-                log.info(f"Remove requested for {name!r} — data preserved at {path}")
+                # Always remove the marker — this deregisters the volume from Docker
+                try:
+                    os.remove(marker_path(name))
+                except FileNotFoundError:
+                    pass
+                if KEEP_DATA:
+                    log.info(f"Removed volume record {name!r} — data preserved at {path} (ADUREFS_KEEP_DATA=true)")
+                elif os.path.isdir(path):
+                    shutil.rmtree(path)
+                    log.info(f"Removed volume {name!r} → {path}")
                 self._send(respond_ok())
 
             else:
@@ -156,15 +205,59 @@ class UnixSocketServer(HTTPServer):
         os.chmod(self.server_address, 0o660)
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
+def wait_for_mount(retries: int = 30, delay: float = 1.0):
+    """Block until BASE_PATH is accessible and writable.
+    This ensures the GlusterFS bind mount is established before
+    accepting any Docker requests."""
+    test = os.path.join(BASE_PATH, '.adurefs_probe')
+    for attempt in range(1, retries + 1):
+        try:
+            os.makedirs(BASE_PATH, mode=0o755, exist_ok=True)
+            with open(test, 'w') as f:
+                f.write('probe')
+            os.remove(test)
+            log.info(f"Mount verified: {BASE_PATH} is accessible")
+            return
+        except Exception as e:
+            log.warning(f"Waiting for {BASE_PATH} to become ready (attempt {attempt}/{retries}): {e}")
+            import time
+            time.sleep(delay)
+    log.error(f"BASE_PATH {BASE_PATH} not accessible after {retries} attempts — starting anyway")
+
+
+def _health_check_loop(interval: float = 15.0):
+    """Periodically verify BASE_PATH is accessible and writable.
+    If the GlusterFS bind mount goes stale, exit so Docker restarts the plugin
+    with a fresh mount."""
+    import time
+    test = os.path.join(BASE_PATH, '.adurefs_probe')
+    consecutive_failures = 0
+    while True:
+        time.sleep(interval)
+        try:
+            with open(test, 'w') as f:
+                f.write('probe')
+            os.remove(test)
+            consecutive_failures = 0
+        except Exception as e:
+            consecutive_failures += 1
+            log.warning(f"Health check failed ({consecutive_failures}/3): {e}")
+            if consecutive_failures >= 3:
+                log.error(f"BASE_PATH {BASE_PATH} unreachable after 3 checks — restarting plugin")
+                os._exit(1)
+
+
 def main():
-    # Ensure base directories exist
-    os.makedirs(BASE_PATH, mode=0o755, exist_ok=True)
     os.makedirs(os.path.dirname(SOCKET_PATH), mode=0o755, exist_ok=True)
 
     log.info("adurefs volume driver starting")
-    log.info(f"  Base path : {BASE_PATH}")
-    log.info(f"  Socket    : {SOCKET_PATH}")
-    log.info(f"  Log level : {LOG_LEVEL}")
+    log.info(f"  Base path  : {BASE_PATH} (plugin-internal)")
+    log.info(f"  Host path  : {HOST_PATH} (returned as Mountpoint)")
+    log.info(f"  Keep data  : {KEEP_DATA}")
+    log.info(f"  Socket     : {SOCKET_PATH}")
+    log.info(f"  Log level  : {LOG_LEVEL}")
+
+    wait_for_mount()
 
     server = UnixSocketServer(SOCKET_PATH, VolumeDriver)
 
@@ -174,12 +267,21 @@ def main():
     server_thread.daemon = True
     server_thread.start()
 
+    health_thread = threading.Thread(target=_health_check_loop, daemon=True)
+    health_thread.start()
+
     def _shutdown(signum, frame):
         log.info("Shutting down")
-        server.server_close()
-        if os.path.exists(SOCKET_PATH):
-            os.remove(SOCKET_PATH)
-        sys.exit(0)
+        try:
+            server.server_close()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(SOCKET_PATH):
+                os.remove(SOCKET_PATH)
+        except Exception:
+            pass
+        os._exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)

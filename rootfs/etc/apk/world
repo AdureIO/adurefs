@@ -1,9 +1,0 @@
-.python-rundeps=20260415.205659
-alpine-baselayout
-alpine-keys
-alpine-release
-apk-tools
-busybox
-ca-certificates
-musl-utils
-tzdata

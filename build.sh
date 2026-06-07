@@ -37,6 +37,6 @@ docker plugin push $FULL_PLUGIN_NAME
 echo "=== Success! ==="
 echo "The plugin is now compiled and registered locally as '$FULL_PLUGIN_NAME'."
 echo "To configure and run it:"
-echo "  docker plugin set $FULL_PLUGIN_NAME volumes.source=/mnt/gluster/swarm/volumes"
+echo "  docker plugin set $FULL_PLUGIN_NAME volumes.source=/mnt/swarm/volumes"
 echo "  docker plugin enable $FULL_PLUGIN_NAME"
 echo ""

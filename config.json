@@ -5,15 +5,9 @@
 	"Env": [
 		{
 			"Name": "ADUREFS_BASE_PATH",
-			"Description": "Internal mount path inside the plugin container — must match Mounts.Destination",
+			"Description": "Internal mount path inside the plugin container — must match Mounts.Destination and PropagatedMount",
 			"Settable": [],
 			"Value": "/data/volumes"
-		},
-		{
-			"Name": "ADUREFS_HOST_PATH",
-			"Description": "Host-side path of the shared filesystem (returned as Mountpoint to Docker)",
-			"Settable": ["value"],
-			"Value": "/mnt/gluster/swarm/volumes"
 		},
 		{
 			"Name": "ADUREFS_KEEP_DATA",
@@ -42,7 +36,7 @@
 			"Name": "volumes",
 			"Description": "Shared filesystem directory bind-mounted into the plugin for directory management",
 			"Settable": ["source"],
-			"Source": "/mnt/gluster/swarm/volumes",
+			"Source": "/mnt/swarm/volumes",
 			"Destination": "/data/volumes",
 			"Type": "bind",
 			"Options": ["rbind"]

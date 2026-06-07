@@ -3,7 +3,7 @@
 adurefs — Shared Filesystem Volume Driver for Docker
 =====================================================
 A lightweight Docker volume plugin by Adure (adure.io) that enables
-named volumes on any shared filesystem (GlusterFS, NFS, CephFS, etc.)
+named volumes on any shared filesystem
 mounted at a common path across all nodes in a Docker Swarm cluster.
 """
 
@@ -19,7 +19,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 BASE_PATH   = os.environ.get('ADUREFS_BASE_PATH',  '/data/volumes')
-HOST_PATH   = os.environ.get('ADUREFS_HOST_PATH',  '/mnt/gluster/swarm/volumes')
 KEEP_DATA   = os.environ.get('ADUREFS_KEEP_DATA',  'true').lower() == 'true'
 SOCKET_PATH = os.environ.get('ADUREFS_SOCKET',     '/run/docker/plugins/adurefs.sock')
 LOG_LEVEL   = os.environ.get('ADUREFS_LOG_LEVEL',  'INFO').upper()
@@ -44,13 +43,6 @@ def vol_path(name: str) -> str:
     if not safe or safe in ('.', '..'):
         raise ValueError(f"Invalid volume name: {name!r}")
     return os.path.join(BASE_PATH, safe)
-
-def host_vol_path(name: str) -> str:
-    """Return the host-side path for a named volume (returned as Mountpoint to Docker)."""
-    safe = os.path.basename(name)
-    if not safe or safe in ('.', '..'):
-        raise ValueError(f"Invalid volume name: {name!r}")
-    return os.path.join(HOST_PATH, safe)
 
 def marker_path(name: str) -> str:
     return os.path.join(vol_path(name), MARKER)
@@ -125,9 +117,8 @@ class VolumeDriver(BaseHTTPRequestHandler):
                 create_volume(path)  # ensure exists even if Create was skipped
                 with _mount_lock:
                     _mount_refs.setdefault(name, set()).add(mount_id)
-                mountpoint = host_vol_path(name)
-                log.info(f"Mounted volume {name!r} (id={mount_id!r}, refs={len(_mount_refs[name])}) → {mountpoint}")
-                self._send(respond_ok(Mountpoint=mountpoint))
+                log.info(f"Mounted volume {name!r} (id={mount_id!r}, refs={len(_mount_refs[name])}) → {path}")
+                self._send(respond_ok(Mountpoint=path))
 
             elif endpoint == '/VolumeDriver.Unmount':
                 with _mount_lock:
@@ -141,17 +132,17 @@ class VolumeDriver(BaseHTTPRequestHandler):
 
             elif endpoint == '/VolumeDriver.Path':
                 if is_managed(name):
-                    self._send(respond_ok(Mountpoint=host_vol_path(name)))
+                    self._send(respond_ok(Mountpoint=vol_path(name)))
                 else:
                     self._send(respond_err(f"Volume {name!r} does not exist"))
 
             elif endpoint == '/VolumeDriver.Get':
                 if is_managed(name):
-                    mountpoint = host_vol_path(name)
+                    path = vol_path(name)
                     self._send(respond_ok(Volume={
                         "Name":       name,
-                        "Mountpoint": mountpoint,
-                        "Status":     {"driver": "adurefs", "mountpoint": mountpoint}
+                        "Mountpoint": path,
+                        "Status":     {"driver": "adurefs", "mountpoint": path}
                     }))
                 else:
                     self._send(respond_err(f"Volume {name!r} does not exist"))
@@ -207,7 +198,7 @@ class UnixSocketServer(HTTPServer):
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 def wait_for_mount(retries: int = 30, delay: float = 1.0):
     """Block until BASE_PATH is accessible and writable.
-    This ensures the GlusterFS bind mount is established before
+    This ensures the shared filesystem bind mount is established before
     accepting any Docker requests."""
     test = os.path.join(BASE_PATH, '.adurefs_probe')
     for attempt in range(1, retries + 1):
@@ -227,7 +218,7 @@ def wait_for_mount(retries: int = 30, delay: float = 1.0):
 
 def _health_check_loop(interval: float = 15.0):
     """Periodically verify BASE_PATH is accessible and writable.
-    If the GlusterFS bind mount goes stale, exit so Docker restarts the plugin
+    If the shared filesystem bind mount goes stale, exit so Docker restarts the plugin
     with a fresh mount."""
     import time
     test = os.path.join(BASE_PATH, '.adurefs_probe')
@@ -251,8 +242,7 @@ def main():
     os.makedirs(os.path.dirname(SOCKET_PATH), mode=0o755, exist_ok=True)
 
     log.info("adurefs volume driver starting")
-    log.info(f"  Base path  : {BASE_PATH} (plugin-internal)")
-    log.info(f"  Host path  : {HOST_PATH} (returned as Mountpoint)")
+    log.info(f"  Base path  : {BASE_PATH} (PropagatedMount root)")
     log.info(f"  Keep data  : {KEEP_DATA}")
     log.info(f"  Socket     : {SOCKET_PATH}")
     log.info(f"  Log level  : {LOG_LEVEL}")
